@@ -44,7 +44,7 @@ TMP_DIR = Path("tmp")
 OUTPUT_DIR = Path(".")
 CHUNK_SIZE = 500_000  # Number of rows to process at a time
 
-# CSV Column Names (do not modify unless data format changes)
+# CSV Column Names and Data Types (based on the data dictionary)
 CSV_COLUMNS = [
     "MMSI", "BaseDateTime", "LAT", "LON", "SOG", "COG", "Heading",
     "VesselName", "IMO", "CallSign", "VesselType", "Status",
@@ -64,6 +64,7 @@ S3_BUCKET_NAME = 'ais-data'
 
 # Create required directories
 TMP_DIR.mkdir(exist_ok=True)
+
 
 class AISDataProcessor:
     """Class for processing AIS data from NOAA"""
@@ -99,12 +100,19 @@ class AISDataProcessor:
 
         for link in soup.find_all('a', href=re.compile(r'\.zip$')):
             href = link.get('href')
-            # Ensure the URL is constructed correctly
-            if not BASE_URL.endswith('/'):
-                url = f"{BASE_URL}/{href}"
+            # Handle relative URLs properly
+            if href.startswith('http'):
+                url = href  # It's already an absolute URL
+            elif href.startswith('/'):
+                # Extract the base domain and protocol
+                base_domain = '/'.join(BASE_URL.split('/')[:3])  # Gets "https://coast.noaa.gov"
+                url = base_domain + href
             else:
-                url = f"{BASE_URL}{href}"
+                # It's a relative URL, join with base URL
+                url = BASE_URL + ('/' if not BASE_URL.endswith('/') else '') + href
+
             urls.append(url)
+            logger.debug(f"Found URL: {url}")
 
         logger.info(f"Found {len(urls)} ZIP files")
         return urls
@@ -170,19 +178,6 @@ class AISDataProcessor:
 
         return csv_path
 
-    def parse_datetime(self, dt_str: str) -> Tuple[int, int, int, int]:
-        """
-        Parse the BaseDateTime string and extract year, month, day, and hour
-
-        Args:
-            dt_str: DateTime string in format 'YYYY-MM-DD HH:MM:SS'
-
-        Returns:
-            Tuple of (year, month, day, hour)
-        """
-        dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
-        return dt.year, dt.month, dt.day, dt.hour
-
     def process_csv_chunk(self, csv_path: Path) -> None:
         """
         Process a CSV file in chunks and convert to Parquet files
@@ -192,12 +187,38 @@ class AISDataProcessor:
         """
         logger.info(f"Processing {csv_path} in chunks of {CHUNK_SIZE:,} rows")
 
+        # Define column types based on the data dictionary
+        dtypes = {
+            'MMSI': str,                 # Text (9)
+            'LAT': float,                # Double (8)
+            'LON': float,                # Double (8)
+            'SOG': float,                # Float (4)
+            'COG': float,                # Float (4)
+            'Heading': float,            # Float (4)
+            'VesselName': str,           # Text (32)
+            'IMO': str,                  # Text (7)
+            'CallSign': str,             # Text (8)
+            'VesselType': 'Int32',       # Integer short
+            'Status': 'Int32',           # Integer short
+            'Length': float,             # Float (4)
+            'Width': float,              # Float (4)
+            'Draft': float,              # Float (4)
+            'Cargo': str,                # Text (4)
+            'TransceiverClass': str      # Text (2)
+        }
+
+        # Handle date parsing separately
+        parse_dates = ['BaseDateTime']
+        date_parser = lambda x: pd.to_datetime(x, format='%Y-%m-%dT%H:%M:%S')
+
         # Create a reader for the CSV file
         csv_reader = pd.read_csv(
             csv_path,
             chunksize=CHUNK_SIZE,
-            names=CSV_COLUMNS,
-            parse_dates=['BaseDateTime']
+            dtype=dtypes,
+            parse_dates=parse_dates,
+            date_parser=date_parser,
+            low_memory=False
         )
 
         # Process each chunk
@@ -217,6 +238,9 @@ class AISDataProcessor:
                 futures = []
 
                 for (year, month, day, hour), group in grouped:
+                    # Convert to integers for directory naming
+                    year, month, day, hour = int(year), int(month), int(day), int(hour)
+
                     # Create the output directory structure
                     output_dir = OUTPUT_DIR / f"year={year}" / f"month={month:02d}" / f"day={day:02d}" / f"hour={hour:02d}"
                     output_dir.mkdir(parents=True, exist_ok=True)
@@ -353,9 +377,6 @@ class AISDataProcessor:
 
 def main():
     """Main function"""
-    # Create required directories
-    TMP_DIR.mkdir(exist_ok=True)
-
     processor = AISDataProcessor()
     processor.run()
 
