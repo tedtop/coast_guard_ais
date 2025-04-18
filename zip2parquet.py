@@ -7,24 +7,19 @@ year=YYYY/month=MM/day=DD/hour=HH/AIS_YYYY_MM_DD_processed_hourHH.parquet
 
 import os
 import sys
-import time
-import shutil
 import logging
 import re
-import concurrent.futures
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+import zipfile
 
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 import boto3
-import zipfile
 
 # Set up logging
 logging.basicConfig(
@@ -42,384 +37,311 @@ logger = logging.getLogger("zip2parquet")
 BASE_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/2024"
 TMP_DIR = Path("tmp")
 OUTPUT_DIR = Path(".")
-CHUNK_SIZE = 500_000  # Number of rows to process at a time
-
-# CSV Column Names and Data Types (based on the data dictionary)
-CSV_COLUMNS = [
-    "MMSI", "BaseDateTime", "LAT", "LON", "SOG", "COG", "Heading",
-    "VesselName", "IMO", "CallSign", "VesselType", "Status",
-    "Length", "Width", "Draft", "Cargo", "TransceiverClass"
-]
-
-# Parallel Processing
-MAX_WORKERS = 4  # Number of parallel threads for processing
 
 # S3 Configuration
-ENABLE_S3_UPLOAD = False  # Set to True to enable S3 upload
+ENABLE_S3_UPLOAD = True  # Set to True to enable S3 upload
 S3_REGION = 'sfo3'
-S3_ENDPOINT = 'https://ais-bucket.sfo3.digitaloceanspaces.com'
+S3_ENDPOINT = 'https://sfo3.digitaloceanspaces.com'
 S3_ACCESS_KEY = 'ACCESS_KEY'
 S3_SECRET_KEY = 'SECRET_KEY'
-S3_BUCKET_NAME = 'ais-data'
+S3_BUCKET_NAME = 'noaa-ais-data'
 
 # Create required directories
 TMP_DIR.mkdir(exist_ok=True)
 
+def get_zip_urls():
+    """
+    Extract all ZIP file URLs from the NOAA AIS data handler index page
 
-class AISDataProcessor:
-    """Class for processing AIS data from NOAA"""
+    Returns:
+        List of URLs to ZIP files
+    """
+    logger.info(f"Fetching ZIP URLs from {BASE_URL}")
+    response = requests.get(BASE_URL)
+    response.raise_for_status()
 
-    def __init__(self):
-        """Initialize the processor"""
-        # Initialize S3 client if uploads are enabled
-        self.s3_client = None
-        if ENABLE_S3_UPLOAD:
-            session = boto3.session.Session()
-            self.s3_client = session.client(
-                's3',
-                region_name=S3_REGION,
-                endpoint_url=S3_ENDPOINT,
-                aws_access_key_id=S3_ACCESS_KEY,
-                aws_secret_access_key=S3_SECRET_KEY
-            )
-            logger.info(f"Initialized S3 client with endpoint {S3_ENDPOINT}, bucket {S3_BUCKET_NAME}")
+    soup = BeautifulSoup(response.text, 'html.parser')
+    urls = []
 
-    def get_zip_urls(self) -> List[str]:
-        """
-        Extract all ZIP file URLs from the NOAA AIS data handler index page
+    for link in soup.find_all('a', href=re.compile(r'\.zip$')):
+        href = link.get('href')
+        # Handle relative URLs properly
+        if href.startswith('http'):
+            url = href  # It's already an absolute URL
+        elif href.startswith('/'):
+            # Extract the base domain and protocol
+            base_domain = '/'.join(BASE_URL.split('/')[:3])  # Gets "https://coast.noaa.gov"
+            url = base_domain + href
+        else:
+            # It's a relative URL, join with base URL
+            url = BASE_URL + ('/' if not BASE_URL.endswith('/') else '') + href
 
-        Returns:
-            List of URLs to ZIP files
-        """
-        logger.info(f"Fetching ZIP URLs from {BASE_URL}")
-        response = requests.get(BASE_URL)
-        response.raise_for_status()
+        urls.append(url)
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        urls = []
+    logger.info(f"Found {len(urls)} ZIP files")
+    return urls
 
-        for link in soup.find_all('a', href=re.compile(r'\.zip$')):
-            href = link.get('href')
-            # Handle relative URLs properly
-            if href.startswith('http'):
-                url = href  # It's already an absolute URL
-            elif href.startswith('/'):
-                # Extract the base domain and protocol
-                base_domain = '/'.join(BASE_URL.split('/')[:3])  # Gets "https://coast.noaa.gov"
-                url = base_domain + href
-            else:
-                # It's a relative URL, join with base URL
-                url = BASE_URL + ('/' if not BASE_URL.endswith('/') else '') + href
+def download_file(url, dest_path):
+    """
+    Download a file from a URL with progress reporting
 
-            urls.append(url)
-            logger.debug(f"Found URL: {url}")
+    Args:
+        url: URL to download
+        dest_path: Path to save the file to
 
-        logger.info(f"Found {len(urls)} ZIP files")
-        return urls
+    Returns:
+        Path to the downloaded file
+    """
+    logger.info(f"Downloading {url} to {dest_path}")
 
-    def download_file(self, url: str, dest_path: Path) -> Path:
-        """
-        Download a file from a URL with progress reporting
+    # Create parent directory if it doesn't exist
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            url: URL to download
-            dest_path: Path to save the file to
+    # Stream download with progress reporting
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
 
-        Returns:
-            Path to the downloaded file
-        """
-        logger.info(f"Downloading {url} to {dest_path}")
+    total_size = int(response.headers.get('content-length', 0))
+    block_size = 1024  # 1 KB
+    progress_bar = tqdm(total=total_size, unit='iB', unit_scale=True, desc=dest_path.name)
 
-        # Create parent directory if it doesn't exist
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, 'wb') as f:
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            f.write(data)
 
-        # Stream download with progress reporting
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
+    progress_bar.close()
 
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 KB
-        progress_bar = tqdm(total=total_size, unit='iB', unit_scale=True, desc=dest_path.name)
+    if total_size != 0 and progress_bar.n != total_size:
+        logger.warning(f"Download incomplete for {url}. Expected {total_size} bytes, got {progress_bar.n} bytes.")
 
-        with open(dest_path, 'wb') as f:
-            for data in response.iter_content(block_size):
-                progress_bar.update(len(data))
-                f.write(data)
+    return dest_path
 
-        progress_bar.close()
+def extract_zip(zip_path):
+    """
+    Extract a ZIP file
 
-        if total_size != 0 and progress_bar.n != total_size:
-            logger.warning(f"Download incomplete for {url}. Expected {total_size} bytes, got {progress_bar.n} bytes.")
+    Args:
+        zip_path: Path to the ZIP file
 
-        return dest_path
+    Returns:
+        Path to the extracted CSV file
+    """
+    logger.info(f"Extracting {zip_path}")
 
-    def extract_zip(self, zip_path: Path) -> Path:
-        """
-        Extract a ZIP file
+    csv_path = None
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        for file in zip_ref.namelist():
+            if file.endswith('.csv'):
+                csv_path = TMP_DIR / file
+                zip_ref.extract(file, TMP_DIR)
+                logger.info(f"Extracted {file} to {csv_path}")
 
-        Args:
-            zip_path: Path to the ZIP file
+    if not csv_path:
+        raise ValueError(f"No CSV file found in {zip_path}")
 
-        Returns:
-            Path to the extracted CSV file
-        """
-        logger.info(f"Extracting {zip_path}")
+    return csv_path
 
-        csv_path = None
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for file in zip_ref.namelist():
-                if file.endswith('.csv'):
-                    csv_path = TMP_DIR / file
-                    zip_ref.extract(file, TMP_DIR)
-                    logger.info(f"Extracted {file} to {csv_path}")
+def process_csv(csv_path):
+    """
+    Process a CSV file line by line and write to Parquet files
 
-        if not csv_path:
-            raise ValueError(f"No CSV file found in {zip_path}")
+    Args:
+        csv_path: Path to the CSV file
+    """
+    logger.info(f"Processing {csv_path}")
 
-        return csv_path
+    # Dictionary to keep track of rows per hour
+    hour_counts = {}
 
-    def process_csv_chunk(self, csv_path: Path) -> None:
-        """
-        Process a CSV file in chunks and convert to Parquet files
+    # Dictionary to store dataframes by hour
+    hour_data = {}
 
-        Args:
-            csv_path: Path to the CSV file
-        """
-        logger.info(f"Processing {csv_path} in chunks of {CHUNK_SIZE:,} rows")
+    # Define column types based on the data dictionary
+    dtypes = {
+        'MMSI': str,                 # Text (9)
+        'BaseDateTime': str,         # Read as string, will convert to datetime
+        'LAT': float,                # Double (8)
+        'LON': float,                # Double (8)
+        'SOG': float,                # Float (4)
+        'COG': float,                # Float (4)
+        'Heading': float,            # Float (4)
+        'VesselName': str,           # Text (32)
+        'IMO': str,                  # Text (7)
+        'CallSign': str,             # Text (8)
+        'VesselType': 'Int32',       # Integer short
+        'Status': 'Int32',           # Integer short
+        'Length': float,             # Float (4)
+        'Width': float,              # Float (4)
+        'Draft': float,              # Float (4)
+        'Cargo': str,                # Text (4)
+        'TransceiverClass': str      # Text (2)
+    }
 
-        # Define column types based on the data dictionary
-        dtypes = {
-            'MMSI': str,                 # Text (9)
-            'LAT': float,                # Double (8)
-            'LON': float,                # Double (8)
-            'SOG': float,                # Float (4)
-            'COG': float,                # Float (4)
-            'Heading': float,            # Float (4)
-            'VesselName': str,           # Text (32)
-            'IMO': str,                  # Text (7)
-            'CallSign': str,             # Text (8)
-            'VesselType': 'Int32',       # Integer short
-            'Status': 'Int32',           # Integer short
-            'Length': float,             # Float (4)
-            'Width': float,              # Float (4)
-            'Draft': float,              # Float (4)
-            'Cargo': str,                # Text (4)
-            'TransceiverClass': str      # Text (2)
-        }
+    # Read the entire CSV file
+    logger.info(f"Reading {csv_path}")
+    df = pd.read_csv(csv_path, dtype=dtypes)
+    total_rows = len(df)
+    logger.info(f"Read {total_rows:,} rows from {csv_path}")
 
-        # Read BaseDateTime column as object and convert to datetime after reading
-        # Instead of using deprecated date_parser parameter
-        csv_reader = pd.read_csv(
-            csv_path,
-            chunksize=CHUNK_SIZE,
-            dtype={**dtypes, 'BaseDateTime': str},  # Read datetime as string initially
-            low_memory=False
-        )
+    # Convert BaseDateTime from string to datetime
+    df['BaseDateTime'] = pd.to_datetime(df['BaseDateTime'], format='%Y-%m-%dT%H:%M:%S')
 
-        # Create a dictionary to store dataframes by hour key
-        hour_data = {}
+    # Add year, month, day, hour columns
+    df['year'] = df['BaseDateTime'].dt.year
+    df['month'] = df['BaseDateTime'].dt.month
+    df['day'] = df['BaseDateTime'].dt.day
+    df['hour'] = df['BaseDateTime'].dt.hour
 
-        # Process each chunk
-        total_rows = 0
+    # Group by year, month, day, hour
+    grouped = df.groupby(['year', 'month', 'day', 'hour'])
 
-        for i, chunk in enumerate(csv_reader):
-            chunk_size = len(chunk)
-            total_rows += chunk_size
-            logger.info(f"Processing chunk {i+1} ({chunk_size:,} rows), Total: {total_rows:,} rows")
+    # Process each group
+    for (year, month, day, hour), group_df in grouped:
+        # Convert to integers to ensure proper directory naming
+        year, month, day, hour = int(year), int(month), int(day), int(hour)
 
-            # Convert BaseDateTime from string to datetime
-            chunk['BaseDateTime'] = pd.to_datetime(chunk['BaseDateTime'], format='%Y-%m-%dT%H:%M:%S')
+        # Create the output directory structure
+        output_dir = OUTPUT_DIR / f"year={year}" / f"month={month:02d}" / f"day={day:02d}" / f"hour={hour:02d}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Group by hour
-            chunk['year'] = chunk['BaseDateTime'].dt.year
-            chunk['month'] = chunk['BaseDateTime'].dt.month
-            chunk['day'] = chunk['BaseDateTime'].dt.day
-            chunk['hour'] = chunk['BaseDateTime'].dt.hour
+        # Create output file path
+        output_file = output_dir / f"AIS_{year}_{month:02d}_{day:02d}_processed_hour{hour:02d}.parquet"
 
-            # Process each hour group
-            grouped = chunk.groupby(['year', 'month', 'day', 'hour'])
+        # Drop the partition columns before saving
+        data_to_save = group_df.drop(columns=['year', 'month', 'day', 'hour'])
 
-            # Append data to the corresponding hour key
-            for (year, month, day, hour), group in grouped:
-                # Create a key for this hour
-                key = (int(year), int(month), int(day), int(hour))
-
-                # Drop year, month, day, hour columns to save memory
-                data_to_append = group.drop(columns=['year', 'month', 'day', 'hour'])
-
-                # If this hour already has data, append to it, otherwise create new entry
-                if key in hour_data:
-                    hour_data[key] = pd.concat([hour_data[key], data_to_append])
-                    logger.debug(f"Appended {len(data_to_append):,} rows to existing data for {key}, total now: {len(hour_data[key]):,}")
-                else:
-                    hour_data[key] = data_to_append
-                    logger.debug(f"Created new data for {key} with {len(data_to_append):,} rows")
-
-        # After processing all chunks, write the aggregated data to parquet files
-        logger.info(f"Writing {len(hour_data)} parquet files with a total of {total_rows:,} rows")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
-
-            for (year, month, day, hour), data in hour_data.items():
-                # Create the output directory structure
-                output_dir = OUTPUT_DIR / f"year={year}" / f"month={month:02d}" / f"day={day:02d}" / f"hour={hour:02d}"
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                # Output file path
-                output_file = output_dir / f"AIS_{year}_{month:02d}_{day:02d}_processed_hour{hour:02d}.parquet"
-
-                logger.info(f"Will save {len(data):,} rows to {output_file}")
-
-                # Submit the task to the executor
-                future = executor.submit(
-                    self.save_to_parquet_and_upload,
-                    data,
-                    output_file,
-                    year,
-                    month,
-                    day,
-                    hour
-                )
-                futures.append(future)
-
-            # Wait for all tasks to complete
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Error processing chunk: {e}")
-
-    def save_to_parquet_and_upload(
-        self,
-        df: pd.DataFrame,
-        output_file: Path,
-        year: int,
-        month: int,
-        day: int,
-        hour: int
-    ) -> None:
-        """
-        Save DataFrame to Parquet file and optionally upload to S3
-
-        Args:
-            df: DataFrame to save
-            output_file: Path to save the Parquet file to
-            year, month, day, hour: Time components for partitioning
-        """
         # Check if the file already exists
         if output_file.exists():
-            logger.info(f"File {output_file} already exists. Checking if we need to append data...")
-
+            logger.info(f"File {output_file} already exists. It will be recreated.")
             try:
-                # Read existing data
-                existing_df = pd.read_parquet(output_file)
-                logger.info(f"Read {len(existing_df):,} existing rows from {output_file}")
-
-                # Concatenate with new data
-                combined_df = pd.concat([existing_df, df], ignore_index=True)
-                logger.info(f"Combined with {len(df):,} new rows, total: {len(combined_df):,} rows")
-
-                # Use the combined DataFrame
-                df = combined_df
+                # Delete the existing file
+                output_file.unlink()
+                logger.info(f"Deleted existing file {output_file}")
             except Exception as e:
-                logger.error(f"Error reading existing file {output_file}: {e}")
-                logger.info(f"Will overwrite the file with new data")
+                logger.error(f"Error deleting existing file {output_file}: {e}")
 
-        # Create the table with partition columns as metadata
-        table = pa.Table.from_pandas(df)
+        # Convert to pyarrow table
+        table = pa.Table.from_pandas(data_to_save)
 
-        # Write the Parquet file with partition information as metadata
-        # Updated to use newer Parquet version 2.6 instead of deprecated 2.0
+        # Write to parquet
         pq.write_table(
             table,
             output_file,
             compression='snappy',
             use_dictionary=True,
-            version='2.6',  # Updated from '2.0' to '2.6'
+            version='2.6',
             data_page_size=1048576,  # 1 MB pages
             write_statistics=True
         )
 
-        logger.info(f"Saved {len(df):,} rows to {output_file}")
+        # Track the number of rows written to this file
+        hour_counts[(year, month, day, hour)] = len(data_to_save)
+        logger.info(f"Saved {len(data_to_save):,} rows to {output_file}")
 
         # Upload to S3 if enabled
-        if ENABLE_S3_UPLOAD and self.s3_client:
-            s3_key = str(output_file.relative_to(OUTPUT_DIR))
-            logger.info(f"Uploading {output_file} to s3://{S3_BUCKET_NAME}/{s3_key}")
+        if ENABLE_S3_UPLOAD:
+            upload_to_s3(output_file)
 
-            try:
-                self.s3_client.upload_file(
-                    str(output_file),
-                    S3_BUCKET_NAME,
-                    s3_key
-                )
-                logger.info(f"Upload complete: s3://{S3_BUCKET_NAME}/{s3_key}")
+    # Log summary of rows written
+    logger.info("Summary of rows written to each output file:")
+    total_written = 0
+    for (year, month, day, hour), count in hour_counts.items():
+        total_written += count
+        logger.info(f"  {year}-{month:02d}-{day:02d} Hour {hour:02d}: {count:,} rows")
 
-                # Verify the upload was successful by checking if the file exists in S3
-                try:
-                    self.s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-                    logger.info(f"Verified file exists in S3: s3://{S3_BUCKET_NAME}/{s3_key}")
+    logger.info(f"Total rows processed: {total_rows:,}")
+    logger.info(f"Total rows written: {total_written:,}")
 
-                    # Only delete the local file after successful upload and verification
-                    output_file.unlink()
-                    logger.info(f"Deleted local file {output_file}")
-                except Exception as e:
-                    logger.error(f"Upload verification failed, keeping local file: {e}")
-            except Exception as e:
-                logger.error(f"Error uploading to S3: {e}")
+    if total_written != total_rows:
+        logger.warning(f"Row count mismatch! Read {total_rows:,} rows but wrote {total_written:,} rows")
 
-    def process_zip_file(self, url: str) -> None:
-        """
-        Download, extract, and process a single ZIP file
+def upload_to_s3(file_path):
+    """
+    Upload a file to S3
 
-        Args:
-            url: URL to the ZIP file
-        """
+    Args:
+        file_path: Path to the file to upload
+    """
+    logger.info(f"Uploading {file_path} to S3")
+
+    # Initialize S3 client
+    session = boto3.session.Session()
+    s3_client = session.client(
+        's3',
+        region_name=S3_REGION,
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY
+    )
+
+    # Upload the file
+    s3_key = str(file_path.relative_to(OUTPUT_DIR))
+    logger.info(f"Uploading {file_path} to s3://{S3_BUCKET_NAME}/{s3_key}")
+
+    try:
+        s3_client.upload_file(
+            str(file_path),
+            S3_BUCKET_NAME,
+            s3_key
+        )
+        logger.info(f"Upload complete: s3://{S3_BUCKET_NAME}/{s3_key}")
+
+        # Verify the upload
         try:
-            # Extract filename from URL
-            filename = url.split('/')[-1]
-            zip_path = TMP_DIR / filename
+            s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+            logger.info(f"Verified file exists in S3: s3://{S3_BUCKET_NAME}/{s3_key}")
 
-            # Download the file
-            self.download_file(url, zip_path)
-
-            # Extract the ZIP file
-            csv_path = self.extract_zip(zip_path)
-
-            # Process the CSV file
-            self.process_csv_chunk(csv_path)
-
-            # Clean up the temporary files
-            os.remove(zip_path)
-            logger.info(f"Deleted {zip_path}")
-
-            os.remove(csv_path)
-            logger.info(f"Deleted {csv_path}")
-
+            # Delete local file after successful upload
+            file_path.unlink()
+            logger.info(f"Deleted local file {file_path}")
         except Exception as e:
-            logger.error(f"Error processing {url}: {e}")
+            logger.error(f"Upload verification failed, keeping local file: {e}")
+    except Exception as e:
+        logger.error(f"Error uploading to S3: {e}")
 
-    def run(self) -> None:
-        """
-        Run the entire process
-        """
-        # Get the list of ZIP URLs
-        urls = self.get_zip_urls()
+def process_zip_file(url):
+    """
+    Download, extract, and process a single ZIP file
 
-        # Process each ZIP file
-        for i, url in enumerate(urls):
-            logger.info(f"Processing file {i+1}/{len(urls)}: {url}")
-            self.process_zip_file(url)
+    Args:
+        url: URL to the ZIP file
+    """
+    try:
+        # Extract filename from URL
+        filename = url.split('/')[-1]
+        zip_path = TMP_DIR / filename
 
-        logger.info("Processing complete!")
+        # Download the file
+        download_file(url, zip_path)
 
+        # Extract the ZIP file
+        csv_path = extract_zip(zip_path)
+
+        # Process the CSV file
+        process_csv(csv_path)
+
+        # Clean up temporary files
+        os.remove(zip_path)
+        logger.info(f"Deleted {zip_path}")
+
+        os.remove(csv_path)
+        logger.info(f"Deleted {csv_path}")
+
+    except Exception as e:
+        logger.error(f"Error processing {url}: {e}")
 
 def main():
     """Main function"""
-    processor = AISDataProcessor()
-    processor.run()
+    # Get the list of ZIP URLs
+    urls = get_zip_urls()
 
+    # Process each ZIP file one at a time
+    for i, url in enumerate(urls):
+        logger.info(f"Processing file {i+1}/{len(urls)}: {url}")
+        process_zip_file(url)
+
+    logger.info("Processing complete!")
 
 if __name__ == "__main__":
     main()
