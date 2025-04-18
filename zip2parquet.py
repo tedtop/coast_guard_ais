@@ -263,8 +263,6 @@ def upload_to_s3(file_path):
     Args:
         file_path: Path to the file to upload
     """
-    logger.info(f"Uploading {file_path} to S3")
-
     # Initialize S3 client
     session = boto3.session.Session()
     s3_client = session.client(
@@ -277,7 +275,7 @@ def upload_to_s3(file_path):
 
     # Upload the file
     s3_key = str(file_path.relative_to(OUTPUT_DIR))
-    logger.info(f"Uploading {file_path} to s3://{S3_BUCKET_NAME}/{s3_key}")
+    logger.info(f"Uploading file to s3://{S3_BUCKET_NAME}/{s3_key}")
 
     try:
         s3_client.upload_file(
