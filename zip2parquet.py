@@ -207,23 +207,28 @@ class AISDataProcessor:
             'TransceiverClass': str      # Text (2)
         }
 
-        # Handle date parsing separately
-        parse_dates = ['BaseDateTime']
-        date_parser = lambda x: pd.to_datetime(x, format='%Y-%m-%dT%H:%M:%S')
-
-        # Create a reader for the CSV file
+        # Read BaseDateTime column as object and convert to datetime after reading
+        # Instead of using deprecated date_parser parameter
         csv_reader = pd.read_csv(
             csv_path,
             chunksize=CHUNK_SIZE,
-            dtype=dtypes,
-            parse_dates=parse_dates,
-            date_parser=date_parser,
+            dtype={**dtypes, 'BaseDateTime': str},  # Read datetime as string initially
             low_memory=False
         )
 
+        # Create a dictionary to store dataframes by hour key
+        hour_data = {}
+
         # Process each chunk
+        total_rows = 0
+
         for i, chunk in enumerate(csv_reader):
-            logger.info(f"Processing chunk {i+1} ({len(chunk):,} rows)")
+            chunk_size = len(chunk)
+            total_rows += chunk_size
+            logger.info(f"Processing chunk {i+1} ({chunk_size:,} rows), Total: {total_rows:,} rows")
+
+            # Convert BaseDateTime from string to datetime
+            chunk['BaseDateTime'] = pd.to_datetime(chunk['BaseDateTime'], format='%Y-%m-%dT%H:%M:%S')
 
             # Group by hour
             chunk['year'] = chunk['BaseDateTime'].dt.year
@@ -234,41 +239,56 @@ class AISDataProcessor:
             # Process each hour group
             grouped = chunk.groupby(['year', 'month', 'day', 'hour'])
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = []
+            # Append data to the corresponding hour key
+            for (year, month, day, hour), group in grouped:
+                # Create a key for this hour
+                key = (int(year), int(month), int(day), int(hour))
 
-                for (year, month, day, hour), group in grouped:
-                    # Convert to integers for directory naming
-                    year, month, day, hour = int(year), int(month), int(day), int(hour)
+                # Drop year, month, day, hour columns to save memory
+                data_to_append = group.drop(columns=['year', 'month', 'day', 'hour'])
 
-                    # Create the output directory structure
-                    output_dir = OUTPUT_DIR / f"year={year}" / f"month={month:02d}" / f"day={day:02d}" / f"hour={hour:02d}"
-                    output_dir.mkdir(parents=True, exist_ok=True)
+                # If this hour already has data, append to it, otherwise create new entry
+                if key in hour_data:
+                    hour_data[key] = pd.concat([hour_data[key], data_to_append])
+                    logger.debug(f"Appended {len(data_to_append):,} rows to existing data for {key}, total now: {len(hour_data[key]):,}")
+                else:
+                    hour_data[key] = data_to_append
+                    logger.debug(f"Created new data for {key} with {len(data_to_append):,} rows")
 
-                    # Output file path
-                    output_file = output_dir / f"AIS_{year}_{month:02d}_{day:02d}_processed_hour{hour:02d}.parquet"
+        # After processing all chunks, write the aggregated data to parquet files
+        logger.info(f"Writing {len(hour_data)} parquet files with a total of {total_rows:,} rows")
 
-                    # Convert to a Parquet file without year, month, day, hour columns
-                    data_to_save = group.drop(columns=['year', 'month', 'day', 'hour'])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = []
 
-                    # Submit the task to the executor
-                    future = executor.submit(
-                        self.save_to_parquet_and_upload,
-                        data_to_save,
-                        output_file,
-                        year,
-                        month,
-                        day,
-                        hour
-                    )
-                    futures.append(future)
+            for (year, month, day, hour), data in hour_data.items():
+                # Create the output directory structure
+                output_dir = OUTPUT_DIR / f"year={year}" / f"month={month:02d}" / f"day={day:02d}" / f"hour={hour:02d}"
+                output_dir.mkdir(parents=True, exist_ok=True)
 
-                # Wait for all tasks to complete
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Error processing chunk: {e}")
+                # Output file path
+                output_file = output_dir / f"AIS_{year}_{month:02d}_{day:02d}_processed_hour{hour:02d}.parquet"
+
+                logger.info(f"Will save {len(data):,} rows to {output_file}")
+
+                # Submit the task to the executor
+                future = executor.submit(
+                    self.save_to_parquet_and_upload,
+                    data,
+                    output_file,
+                    year,
+                    month,
+                    day,
+                    hour
+                )
+                futures.append(future)
+
+            # Wait for all tasks to complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error processing chunk: {e}")
 
     def save_to_parquet_and_upload(
         self,
@@ -287,16 +307,36 @@ class AISDataProcessor:
             output_file: Path to save the Parquet file to
             year, month, day, hour: Time components for partitioning
         """
+        # Check if the file already exists
+        if output_file.exists():
+            logger.info(f"File {output_file} already exists. Checking if we need to append data...")
+
+            try:
+                # Read existing data
+                existing_df = pd.read_parquet(output_file)
+                logger.info(f"Read {len(existing_df):,} existing rows from {output_file}")
+
+                # Concatenate with new data
+                combined_df = pd.concat([existing_df, df], ignore_index=True)
+                logger.info(f"Combined with {len(df):,} new rows, total: {len(combined_df):,} rows")
+
+                # Use the combined DataFrame
+                df = combined_df
+            except Exception as e:
+                logger.error(f"Error reading existing file {output_file}: {e}")
+                logger.info(f"Will overwrite the file with new data")
+
         # Create the table with partition columns as metadata
         table = pa.Table.from_pandas(df)
 
         # Write the Parquet file with partition information as metadata
+        # Updated to use newer Parquet version 2.6 instead of deprecated 2.0
         pq.write_table(
             table,
             output_file,
             compression='snappy',
             use_dictionary=True,
-            version='2.0',
+            version='2.6',  # Updated from '2.0' to '2.6'
             data_page_size=1048576,  # 1 MB pages
             write_statistics=True
         )
