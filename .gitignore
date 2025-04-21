@@ -39,7 +39,6 @@ coverage.xml
 # Project specific
 tmp/
 *.zip
-*.csv
 year=*/
 *.parquet
 logs/
@@ -48,3 +47,4 @@ logs/
 # Credentials
 .aws/
 credentials.json
+credentials.txt

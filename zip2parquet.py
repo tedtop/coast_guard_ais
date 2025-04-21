@@ -20,6 +20,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 import boto3
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(
@@ -39,12 +43,12 @@ TMP_DIR = Path("tmp")
 OUTPUT_DIR = Path(".")
 
 # S3 Configuration
-ENABLE_S3_UPLOAD = True  # Set to True to enable S3 upload
-S3_REGION = 'sfo3'
-S3_ENDPOINT = 'https://sfo3.digitaloceanspaces.com'
-S3_ACCESS_KEY = 'ACCESS_KEY'
-S3_SECRET_KEY = 'SECRET_KEY'
-S3_BUCKET_NAME = 'noaa-ais-data'
+ENABLE_S3_UPLOAD = False  # Set to True to enable S3 upload
+S3_REGION = os.getenv('S3_REGION', 'sfo3')
+S3_ENDPOINT = os.getenv('S3_ENDPOINT', 'https://sfo3.digitaloceanspaces.com')
+S3_ACCESS_KEY = os.getenv('S3_ACCESS_KEY', 'ACCESS_KEY')
+S3_SECRET_KEY = os.getenv('S3_SECRET_KEY', 'SECRET_KEY')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'noaa-ais-data')
 
 # Create required directories
 TMP_DIR.mkdir(exist_ok=True)
